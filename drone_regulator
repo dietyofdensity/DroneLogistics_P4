@@ -1,0 +1,248 @@
+from __future__ import print_function
+import logging
+import time
+from threading import Thread
+from threading import Timer
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+
+
+from vicon_dssdk import ViconDataStream
+
+import cflib
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.log import LogConfig
+from simple_pid import PID
+
+logging.basicConfig(level=logging.ERROR) # konfigurær logging
+client = ViconDataStream.RetimingClient() # opret
+
+class pidholder:
+    # class contains a single pid controller, such that it can be initated and updated from seperate functions
+    pid=0
+    def __init__(self,Kp,Ki,Kd): # create an instance if the píd class
+        global pid
+        pid = PID(Kp,Ki, Kd, setpoint=1)
+
+    # Assume we have a system we want to control in controlled_system
+    def update(self,v):
+        global pid
+        control = pid(v)
+        return control
+
+class controllsystem: # contains all the pid controlles in the first block of the dynamic system aswell as the truncating limiters
+    rollpid=0
+    rolltrnc=0
+    pitchpid=0
+    pitchtrnc = 0
+    forcepid=0
+    forcetrnc=0
+
+
+    def __init__(self,p1,p2,p3,t1,t2,t3): # sets up pid controllers with values from p1,p2,p3
+
+        self.rollpid = pidholder( p1[0], p1[1], p1[2])
+        self.pitchpid = pidholder(p2[0], p2[1], p2[2])
+        self.forcepid = pidholder(p3[0], p3[1], p3[2])
+        # then sets up the truncating limiters for each of these based on t1,t2 and t3
+        self.rolltrnc = truncker(t1[0],t1[1])
+        self.pitchtrnc = truncker(t2[0], t2[1])
+        self.forcetrnc = truncker(t3[0], t3[1])
+
+
+    def settime(self,tim): # assings the amouunt of time between each time we update, time is in miliseconds
+
+        sectime=tim/1000# the function takes seconnds so they are converted
+        self.rollpid.pid.sample_time(   sectime  ) # set the sample time equally for all pid controllers
+        self.pitchpid.pid.sample_time(  sectime  )
+        self.forcepid.pid.sample_time(  sectime  )
+
+    def update(self,x): # take the xyz cordinate
+        return [ self.rolltrnc.trnc(  self.rollpid.update( x[0])),
+                 self.pitchtrnc.trnc( self.pitchpid.update(x[1])),
+                 self.forcetrnc.trnc( self.forcepid.update(x[2]))]
+
+class truncker:
+    lB=0
+    UB=0
+    def __init__(self,lower,upper): # initiate a truncater, with its upper and lower bounds
+        global lB,UB
+        lB=lower
+        UB=upper
+
+    def trnc(self,v): # truncate the value v to make shure it is in the desired range of inputs for comands
+        if(v<lB):
+            v=lB
+        elif(v>UB):
+            v=UB
+        return v
+
+
+
+
+
+class AltHoldExample: # controlls the connection to the dron and vicon
+
+    def __init__(self, link_uri , client , name):
+        """ Initialize and run the example with the specified link_uri """
+        self.msperiod=10
+        self._cf = Crazyflie()
+        self.controller=controllsystem([1,0,1],[1,0,1],[5,0,5],[0.17,-0.17],[0.17,-0.17],[0,1.0])
+        self.controller.settime(self.msperiod)
+        self._cf.connected.add_callback(self._connected)
+        self._cf.disconnected.add_callback(self._disconnected)
+        self._cf.connection_failed.add_callback(self._connection_failed)
+        self._cf.connection_lost.add_callback(self._connection_lost)
+
+        self._client = client
+        self._Vicon_object_name = name
+
+        self._cf.open_link(link_uri)
+        self.is_connected = True
+        # Variable used to keep main loop occupied until disconnect
+        print('Connecting to %s' % link_uri)
+
+    def _connected(self, link_uri):
+        """ This callback is called form the Crazyflie API when a Crazyflie
+        has been connected and the TOCs have been downloaded."""
+        print('Connected to %s' % link_uri)
+        # Start a separate thread to do the motor test.
+        # Do not hijack the calling thread!
+        # The definition of the logconfig can be made before connecting
+        self._lg_stab = LogConfig(name='motors', period_in_ms=self.msperiod)
+        self._lg_stab.add_variable('motor.m1', 'float')
+        self._lg_stab.add_variable('motor.m2', 'float')
+        self._lg_stab.add_variable('motor.m3', 'float')
+        self._lg_stab.add_variable('motor.m4', 'float')
+
+        # Adding the configuration cannot be done until a Crazyflie is
+        # connected, since we need to check that the variables we
+        # would like to log are in the TOC.
+        try:
+            self._cf.log.add_config(self._lg_stab)
+            # This callback will receive the data
+            self._lg_stab.data_received_cb.add_callback(self._stab_log_data)
+            # This callback will be called on errors
+            self._lg_stab.error_cb.add_callback(self._stab_log_error)
+            # Start the logging
+            self._lg_stab.start()
+        except KeyError as e:
+            print('Could not start log configuration,'
+                  '{} not found in TOC'.format(str(e)))
+        except AttributeError:
+            print('Could not add Stabilizer log config, bad configuration.')
+
+        # Start a timer to disconnect in 10s
+        t = Timer(20, self._cf.close_link)
+        t.start()
+
+        Thread(target=self._hover_test).start()
+
+    def _connection_failed(self, link_uri, msg):
+        """Callback when connection initial connection fails (i.e no Crazyflie
+        at the specified address)"""
+        print('Connection to %s failed: %s' % (link_uri, msg))
+
+    def _connection_lost(self, link_uri, msg):
+        """Callback when disconnected after a connection has been made (i.e
+        Crazyflie moves out of range)"""
+        print('Connection to %s lost: %s' % (link_uri, msg))
+
+    def _disconnected(self, link_uri):
+        """Callback when the Crazyflie is disconnected (called in all cases)"""
+        print('Disconnected from %s' % link_uri)
+        self.is_connected = False
+
+    def _stab_log_error(self, logconf, msg):
+        """Callback from the log API when an error occurs"""
+        print('Error when logging %s: %s' % (logconf.name, msg))
+
+    def getdronepos(self):
+        try:
+            self._client.UpdateFrame()
+
+            subjectNames = self._client.GetSubjectNames()
+            for subjectName in subjectNames:
+                #print(subjectName)
+                if (True):
+                    segmentNames = client.GetSegmentNames(subjectName)
+                    #print(segmentNames)
+                    for segmentName in segmentNames:
+                        Vipos = client.GetSegmentGlobalTranslation(subjectName, segmentName)
+                        # print( segmentName, 'has global rotation( helical )', client.GetSegmentGlobalRotationHelical( subjectName, segmentName ) )
+                        VIrot = client.GetSegmentGlobalRotationEulerXYZ(subjectName, segmentName)
+                        #print(Vipos)
+                        return Vipos[0]
+        except:
+            print("no update")
+    def regulation(self):
+        return 2
+    def _stab_log_data(self, timestamp, data, logconf):
+        """Callback from a the log API when data arrives"""
+        VIPOS=self.getdronepos() # get the drones position from the vicon system
+        print(f'[{timestamp}][{logconf.name}][zpos:{VIPOS}: ', end='')
+        for name, value in data.items():
+            print(f'{name}: {value:3.3f} ', end='')
+        print()
+        target=[0,0,1] # establish goal point
+
+        retvar = controllsystem.update([target[0]-VIPOS[0], target[1]-VIPOS[1], target[2]-VIPOS[2]]) # run the refrence value throug the controll systen
+
+        int16max=65535
+        self._cf.commander.send_setpoint(retvar[0],retvar[1],0,retvar[2]*int16max) # send the generated comand to the drone
+
+
+    def _hover_test(self):
+        print("sending initial thrust of 0")
+
+        self._cf.commander.send_setpoint(0,0,0,0)
+        time.sleep(0.5)
+        self._cf.commander.send_setpoint(0, 0, 0, 40080)
+        time.sleep(0.1)
+        print("putting in althold")
+        self._cf.param.set_value("flightmode.althold","1")
+
+        print("Stay in althold for 7s")
+
+        it=0
+
+        while it<700:
+            self._cf.commander.send_setpoint(0,0,0,37067)
+            self._cf.param.set_value("flightmode.althold","1")
+            time.sleep(0.01)
+            it+=1
+
+        print("Close connection")
+        self._cf.commander.send_setpoint(0,0,0,0)
+        self._cf.close_link()
+
+
+if __name__ == '__main__':
+    # Initialize the low-level drivers (don't list the debug drivers)
+    client.Connect("192.168.1.33:801")
+
+    # Check the version
+    print('Version', client.GetVersion())
+
+    client.SetAxisMapping(ViconDataStream.Client.AxisMapping.EForward, ViconDataStream.Client.AxisMapping.ELeft,
+                          ViconDataStream.Client.AxisMapping.EUp)
+    xAxis, yAxis, zAxis = client.GetAxisMapping()
+    print('X Axis', xAxis, 'Y Axis', yAxis, 'Z Axis', zAxis)
+
+    # client.SetMaximumPrediction( 10 )
+    print('Maximum Prediction', client.MaximumPrediction())
+    cflib.crtp.init_drivers(enable_debug_driver=False)
+    # Scan for Crazyflies and use the first one found
+    print('Scanning interfaces for Crazyflies...')
+    available = cflib.crtp.scan_interfaces()
+    print('Crazyflies found:')
+    for i in available:
+        print(i[0])
+
+    if len(available) > 0:
+        le = AltHoldExample(available[0][0],client,"crazyfly")
+
+    else:
+        print('No Crazyflies found, cannot run example')
